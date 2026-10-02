@@ -1,0 +1,7 @@
+matplotlib>=3.6
+numpy>=1.23
+Pillow>=9.3
+tqdm>=4.64
+
+# Weights & Biases 为可选功能；需要在线实验记录时再安装：
+# wandb>=0.13

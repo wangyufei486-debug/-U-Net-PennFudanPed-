@@ -1,0 +1,26 @@
+*.py[cod]
+__pycache__/
+.idea/
+.vscode/
+venv/
+.venv/
+
+# 本地数据、模型和实验输出
+/PennFudanPed/
+/PennFudanPed.zip
+/data/
+/checkpoints/
+/outputs/
+/test_images/
+/wandb/
+*.pth
+*.pt
+
+# 原项目中本次 PennFudanPed 实践未使用的 Carvana/发布文件
+/.github/
+/scripts/
+/Dockerfile
+/hubconf.py
+
+.DS_Store
+Thumbs.db
