@@ -1,8 +1,8 @@
 # U-Net PennFudanPed 语义分割实践
 
-这是我第一次完整复现语义分割训练流程的学习项目。目前版本以“完整跑通”为主要目标：将原 `Pytorch-UNet` 项目面向 Carvana 汽车分割的数据流程，适配为基于 `PennFudanPed` 数据集的行人二分类语义分割。
+这是我第一次完整复现并优化语义分割训练流程的学习项目。项目将原 `Pytorch-UNet` 面向 Carvana 汽车分割的数据流程，适配为基于 `PennFudanPed` 数据集的行人二分类语义分割，并进一步对训练轮数、学习率和优化器进行了对比实验。
 
-> 当前状态：`v0.1` 初版。训练、验证、checkpoint 保存和自训练模型预测均已跑通，后续会继续优化分割效果和训练策略。
+> 当前状态：`v0.2`。已完成训练、验证、最佳 checkpoint 保存、单图预测和优化器/学习率对比；当前最佳模型使用 AdamW，17 张验证图片上的 Dice 为 `0.848330`。
 
 ## 项目目标
 
@@ -57,6 +57,11 @@ n_classes = 2
 5. 验证 DataLoader 使用 `drop_last=False`，避免小型验证集丢失最后一个 batch。
 6. W&B 改为可选依赖：未安装时仍可正常完成本地训练。
 7. 训练日志增加每个 epoch 的平均 loss。
+8. 支持通过 `--optimizer` 切换 RMSprop 与 AdamW，并通过 `--run-name` 分别保存实验权重。
+9. 固定模型初始化、数据划分和 DataLoader 打乱随机种子，使不同参数实验更可比。
+10. 将验证调整为每个 epoch 结束后执行一次，并只保存验证 Dice 最高的模型。
+11. 训练 DiceLoss 与验证 Dice 都忽略背景类别，减少背景像素占比过大造成的指标偏差。
+12. 修正验证集最后一个不足 batch 的批次权重，并加入 NaN/Inf Loss 检测。
 
 ## 项目结构
 
@@ -77,12 +82,16 @@ U-Net-PennFudanPed/
 ├── evaluate.py
 ├── validate.py
 ├── predict.py
+├── test_images/
+│   └── person.png
+├── outputs/
+│   └── person_adamw_mask.png
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
 
-数据集、训练权重和预测输出不会上传到仓库。
+完整数据集和训练权重不会上传到仓库；仅保留 README 使用的一张测试图片和对应预测结果。
 
 ## 环境
 
@@ -167,31 +176,46 @@ batch mask shape: torch.Size([2, 256, 256])
 
 ## 4. 训练
 
-本次初版使用 5 个 epoch，只验证完整流程：
+训练脚本支持选择优化器、学习率、随机种子和实验名称。当前最佳实验使用 AdamW：
 
 ```powershell
-python .\train.py -e 5 -b 2 -s 0.5 --classes 2 --amp
+python .\train.py `
+  -e 30 `
+  -b 2 `
+  -s 0.5 `
+  -l 1e-4 `
+  -c 2 `
+  --optimizer adamw `
+  --seed 0 `
+  --run-name adamw_lr1e-4
 ```
 
-如果没有 CUDA，请去掉 `--amp`：
+如需启用混合精度，可以在命令末尾增加 `--amp`。本项目还支持 RMSprop：
 
 ```powershell
-python .\train.py -e 5 -b 2 -s 0.5 --classes 2
+python .\train.py `
+  -e 30 `
+  -b 2 `
+  -s 0.5 `
+  -l 1e-5 `
+  -c 2 `
+  --optimizer rmsprop `
+  --momentum 0.9 `
+  --seed 0 `
+  --run-name rmsprop_lr1e-5
 ```
 
-训练集和验证集按 `90%/10%` 划分，并使用固定随机种子 `0`。每个 epoch 结束后会生成：
+训练集和验证集按 `90%/10%` 划分，并使用固定随机种子 `0`。每个 epoch 结束后进行一次验证；仅当验证 Dice 创新高时才覆盖对应实验的最佳权重：
 
 ```text
-checkpoints/checkpoint_epoch1.pth
-...
-checkpoints/checkpoint_epoch5.pth
+checkpoints/adamw_lr1e-4_best.pth
 ```
 
 ## 5. 独立验证 checkpoint
 
 ```powershell
 python .\validate.py `
-  --model .\checkpoints\checkpoint_epoch5.pth `
+  --model .\checkpoints\adamw_lr1e-4_best.pth `
   --batch-size 2 `
   --scale 0.5 `
   --classes 2 `
@@ -206,40 +230,51 @@ python .\validate.py `
 New-Item -ItemType Directory -Force .\outputs
 
 python .\predict.py `
-  --model .\checkpoints\checkpoint_epoch5.pth `
+  --model .\checkpoints\adamw_lr1e-4_best.pth `
   --input .\test_images\person.png `
-  --output .\outputs\person_mask.png `
+  --output .\outputs\person_adamw_mask.png `
   --scale 0.5 `
   --classes 2
 ```
 
 如果本地 Matplotlib/OpenMP 环境正常，可以增加 `--viz` 显示结果。
 
-## 初版实验结果
+## 优化器与参数对比实验
 
-| 配置 | 数值 |
-|---|---:|
-| 原始图片 / mask | 170 / 170 |
-| 训练集 / 验证集 | 153 / 17 |
-| Epochs | 5 |
-| Batch size | 2 |
-| Scale | 0.5 |
-| Optimizer | RMSprop |
-| Loss | CrossEntropy + Dice Loss |
-| 最终 checkpoint 验证 Dice | 0.701290 |
-| 单张验证图片 Dice | 0.661027 |
+所有有效对比实验均使用相同的 U-Net 结构、`153/17` 训练/验证划分、`batch size=2`、`scale=0.5` 和随机种子 `0`。模型结构没有更换，变化的是优化器与训练策略。
 
-这些结果只代表小数据集、少量 epoch、从零训练情况下的初步实验，不能与 Carvana 官方成绩或其他正式基准直接比较。目前预测仍可能将树木、阴影等背景误判为人物。
+| 实验 | Optimizer | Learning rate | Epochs | 结果 / Validation Dice |
+|---|---|---:|---:|---:|
+| v0.1 流程基线 | RMSprop | `1e-5` | 5 | `0.701290` |
+| 增加训练轮数 | RMSprop | `1e-5` | 30 | 约 `0.64`，后期进入平台期 |
+| 提高学习率 | RMSprop | `5e-5` | 30（计划） | Loss 出现 NaN，实验无效 |
+| v0.2 当前最佳 | AdamW | `1e-4` | 30 | **`0.848330`** |
+
+当前最佳结果相较 v0.1 基线提高 `0.147040`，即约 **14.7 个 Dice 百分点**。RMSprop 在较高学习率和高动量组合下发生数值发散，因此训练脚本增加了非有限 Loss 检测，并将 RMSprop 默认 momentum 调整为 `0.9`。
+
+需要说明的是，v0.2 除了将优化器改为 AdamW，还同步修正了前景 DiceLoss、验证频率和验证 batch 加权，因此 `0.848330` 应理解为整体训练流程优化后的结果，不能将全部提升仅归因于优化器。
+
+### 单张图片预测效果
+
+下图展示当前最佳模型 `adamw_lr1e-4_best.pth` 在一张验证图片上的定性预测结果：
+
+| 输入图片 | 预测 person mask |
+|---|---|
+| ![PennFudanPed 单张输入](test_images/person.png) | ![AdamW U-Net 行人分割结果](outputs/person_adamw_mask.png) |
+
+预测结果已经能够较完整地覆盖行人的头部、躯干和四肢，边缘轮廓也明显优于早期模型。`0.848330` 是整个 17 张验证集的 Dice，不是这张图片单独计算出的 Dice。
+
+这些结果来自小规模数据集上的单次固定划分实验，不能与 Carvana 官方成绩或其他正式基准直接比较。后续仍需通过多个随机种子或交叉验证确认提升的稳定性。
 
 ## 后续优化计划
 
 - 增加同步的 image/mask 数据增强；
-- 增加训练 epoch，并保存最佳验证 checkpoint；
-- 对比不同学习率、优化器和 scheduler；
+- 使用多个随机种子重复实验，并尝试 K-fold 交叉验证；
+- 继续细化 AdamW 学习率、weight decay 和 scheduler；
 - 增加 IoU、Precision、Recall 等指标；
 - 改进类别不平衡处理；
 - 尝试预训练编码器或其他 U-Net 变体；
-- 增加预测叠加图和训练曲线；
+- 增加预测叠加图、训练曲线和失败案例分析；
 - 增加测试和更完整的实验记录。
 
 ## 参考与许可

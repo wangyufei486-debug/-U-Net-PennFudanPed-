@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import sys
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +28,17 @@ dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
 
+def set_seed(seed: int):
+    """固定模型初始化和数据打乱顺序，使不同超参数实验可以公平比较。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 class NullExperiment:
     """未安装 W&B 时保留训练流程，但跳过在线实验记录。"""
     def __init__(self):
@@ -49,8 +61,11 @@ def train_model(
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
-        weight_decay: float = 1e-8,
-        momentum: float = 0.999,
+        optimizer_name: str = 'rmsprop',
+        seed: int = 0,
+        run_name: str = 'experiment',
+        weight_decay=None,
+        momentum: float = 0.9,
         gradient_clipping: float = 1.0,
 ):
     # 1. Create dataset
@@ -62,11 +77,21 @@ def train_model(
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(seed))
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
+    # loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    loader_args = dict(
+        batch_size=batch_size,
+        num_workers=0,
+        pin_memory=False
+    )
+    train_loader = DataLoader(
+        train_set,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
+        **loader_args
+    )
     # 小型数据集也应验证最后一个不足 batch 的样本，避免丢失验证数据。
     val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
 
@@ -78,6 +103,7 @@ def train_model(
         experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
+             optimizer=optimizer_name, seed=seed, run_name=run_name,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
     )
 
@@ -85,6 +111,9 @@ def train_model(
         Epochs:          {epochs}
         Batch size:      {batch_size}
         Learning rate:   {learning_rate}
+        Optimizer:       {optimizer_name}
+        Random seed:     {seed}
+        Run name:        {run_name}
         Training size:   {n_train}
         Validation size: {n_val}
         Checkpoints:     {save_checkpoint}
@@ -94,12 +123,42 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    optimizer_name = optimizer_name.lower()
+    if optimizer_name == 'rmsprop':
+        effective_weight_decay = 1e-8 if weight_decay is None else weight_decay
+        optimizer = optim.RMSprop(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=effective_weight_decay,
+            momentum=momentum,
+            foreach=True
+        )
+    elif optimizer_name == 'adamw':
+        effective_weight_decay = 1e-4 if weight_decay is None else weight_decay
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=effective_weight_decay,
+            foreach=True
+        )
+    else:
+        raise ValueError(f'Unsupported optimizer: {optimizer_name}')
+
+    logging.info(f'Optimizer weight decay: {effective_weight_decay}')
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    # 单独保留“保存最佳模型”的开关，并关闭旧的逐 Epoch 保存逻辑。
+    # 旧保存代码仍留在下方以减少对现有训练流程的改动，但条件恒为 False。
+    save_best_checkpoint = save_checkpoint
+    save_checkpoint = False
+    best_val_score = -1.0
+    safe_run_name = ''.join(
+        char if char.isalnum() or char in ('-', '_', '.') else '_'
+        for char in run_name
+    )
+    best_checkpoint_path = dir_checkpoint / f'{safe_run_name}_best.pth'
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -120,15 +179,33 @@ def train_model(
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        ce_loss = criterion(masks_pred.squeeze(1), true_masks.float())
+                        dice_component = dice_loss(
+                            torch.sigmoid(masks_pred.squeeze(1)),
+                            true_masks.float(),
+                            multiclass=False
+                        )
                     else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                        ce_loss = criterion(masks_pred, true_masks)
+                        probabilities = F.softmax(masks_pred, dim=1).float()
+                        true_masks_one_hot = F.one_hot(
+                            true_masks, model.n_classes
+                        ).permute(0, 3, 1, 2).float()
+                        # 与验证指标保持一致：背景类别不参与 DiceLoss。
+                        dice_component = dice_loss(
+                            probabilities[:, 1:],
+                            true_masks_one_hot[:, 1:],
                             multiclass=True
                         )
+                    loss = ce_loss + dice_component
+
+                if not torch.isfinite(loss):
+                    current_lr = optimizer.param_groups[0]['lr']
+                    raise FloatingPointError(
+                        f'Non-finite loss detected at epoch {epoch}, step {global_step + 1}. '
+                        f'CE={float(ce_loss):.6f}, DiceLoss={float(dice_component):.6f}, '
+                        f'learning_rate={current_lr}. Try a lower learning rate or disable AMP.'
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -145,10 +222,15 @@ def train_model(
                     'step': global_step,
                     'epoch': epoch
                 })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+                pbar.set_postfix(**{
+                    'loss': loss.item(),
+                    'CE': ce_loss.item(),
+                    'DiceLoss': dice_component.item()
+                })
 
                 # Evaluation round
-                division_step = (n_train // (5 * batch_size))
+                # 每个 Epoch 结束时验证一次，避免同一轮多次调整学习率。
+                division_step = len(train_loader)
                 if division_step > 0:
                     if global_step % division_step == 0:
                         histograms = {}
@@ -163,7 +245,21 @@ def train_model(
                         val_score = evaluate(model, val_loader, device, amp)
                         scheduler.step(val_score)
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
+                        val_score_value = float(val_score)
+                        logging.info('Validation Dice score: {}'.format(val_score_value))
+
+                        # 验证 Dice 越大越好；创新高时覆盖同一个最佳模型文件。
+                        if save_best_checkpoint and val_score_value > best_val_score:
+                            best_val_score = val_score_value
+                            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                            state_dict = model.state_dict()
+                            state_dict['mask_values'] = dataset.mask_values
+                            torch.save(state_dict, str(best_checkpoint_path))
+                            logging.info(
+                                f'New best checkpoint saved! '
+                                f'Epoch: {epoch}, validation Dice: {best_val_score:.6f}, '
+                                f'path: {best_checkpoint_path}'
+                            )
                         if wandb is not None:
                             try:
                                 experiment.log({
@@ -197,6 +293,16 @@ def get_args():
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
+    parser.add_argument('--optimizer', choices=['rmsprop', 'adamw'], default='rmsprop',
+                        help='Optimizer used for training')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='Momentum used by RMSprop (ignored by AdamW)')
+    parser.add_argument('--weight-decay', type=float, default=None,
+                        help='Optimizer weight decay; defaults to 1e-8 for RMSprop and 1e-4 for AdamW')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Random seed used for initialization, split and shuffling')
+    parser.add_argument('--run-name', type=str, default=None,
+                        help='Name used for the best checkpoint file')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
@@ -214,6 +320,9 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
+
+    set_seed(args.seed)
+    run_name = args.run_name or f'{args.optimizer}_lr{args.lr:g}_seed{args.seed}'
 
     # Change here to adapt to your data
     # n_channels=3 for RGB images
@@ -242,7 +351,12 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            optimizer_name=args.optimizer,
+            seed=args.seed,
+            run_name=run_name,
+            weight_decay=args.weight_decay,
+            momentum=args.momentum
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -258,5 +372,10 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            optimizer_name=args.optimizer,
+            seed=args.seed,
+            run_name=run_name,
+            weight_decay=args.weight_decay,
+            momentum=args.momentum
         )

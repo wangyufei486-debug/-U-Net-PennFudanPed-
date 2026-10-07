@@ -10,8 +10,10 @@ venv/
 /PennFudanPed.zip
 /data/
 /checkpoints/
-/outputs/
-/test_images/
+/outputs/*
+!/outputs/person_adamw_mask.png
+/test_images/*
+!/test_images/person.png
 /wandb/
 *.pth
 *.pt
